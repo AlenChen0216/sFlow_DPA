@@ -95,6 +95,15 @@ static doca_error_t create_verbs_context(const char *device_name,
 		if (strcmp(found_name, device_name) != 0)
 			continue;
 
+		status = doca_dpa_cap_is_supported(devinfo_list[i]);
+		if (status != DOCA_SUCCESS) {
+			fprintf(stderr,
+				"DPA is not supported through DOCA device '%s': %s\n",
+				device_name,
+				doca_error_get_descr(status));
+			break;
+		}
+
 		status = doca_devinfo_get_pci_func_type(devinfo_list[i], &function_type);
 		if (status != DOCA_SUCCESS) {
 			log_doca_error("doca_devinfo_get_pci_func_type failed", status);
@@ -605,6 +614,44 @@ static int parse_packet_count(const char *value, uint32_t *packet_count)
 	return 0;
 }
 
+/*
+ * doca_dpa_rpc() is blocking. The DPA kernel writes this host-process-owned
+ * allocation (x86-owned when this binary runs on x86), executes
+ * __dpa_thread_window_writeback(), and only then returns from the RPC. Copying
+ * the record here gives the CPU consumer a stable snapshot before any DOCA
+ * resources are destroyed.
+ */
+static int snapshot_output(const struct sflow_dedicated_output *shared_output,
+			   uint32_t expected_packets,
+			   struct sflow_dedicated_output *snapshot)
+{
+	memcpy(snapshot, shared_output, sizeof(*snapshot));
+
+	if (snapshot->abi_version != SFLOW_OUTPUT_ABI_VERSION) {
+		fprintf(stderr,
+			"Invalid DPA output ABI version: got %" PRIu32 ", expected %u\n",
+			snapshot->abi_version,
+			SFLOW_OUTPUT_ABI_VERSION);
+		return -1;
+	}
+	if (snapshot->packets_received != expected_packets) {
+		fprintf(stderr,
+			"Incomplete DPA output: got %" PRIu64
+			" packet(s), expected %" PRIu32 "\n",
+			snapshot->packets_received,
+			expected_packets);
+		return -1;
+	}
+	if (snapshot->last_packet_length > SFLOW_MAX_PACKET_SIZE) {
+		fprintf(stderr,
+			"Invalid last packet length in DPA output: %" PRIu32 "\n",
+			snapshot->last_packet_length);
+		return -1;
+	}
+
+	return 0;
+}
+
 static void print_output(const struct sflow_dedicated_output *output)
 {
 	uint32_t length = output->dedicated_data_length;
@@ -639,6 +686,7 @@ static void print_output(const struct sflow_dedicated_output *output)
 int main(int argc, char **argv)
 {
 	struct app_resources resources = {0};
+	struct sflow_dedicated_output output_snapshot;
 	struct doca_log_backend *sdk_log = NULL;
 	uint32_t packet_count = 1;
 	uint64_t rpc_return_value = UINT64_MAX;
@@ -661,6 +709,19 @@ int main(int argc, char **argv)
 		fprintf(stderr, "This program must run with root privileges\n");
 		return EXIT_FAILURE;
 	}
+
+#if defined(__x86_64__)
+	printf("Result owner: x86_64 host process (direct DPA-to-host memory)\n");
+#elif defined(__aarch64__)
+	fprintf(stderr,
+		"Notice: this is an Arm build. Its output allocation belongs to the "
+		"BlueField OS and is not directly readable by a separate x86 host. "
+		"Build and run this program on x86_64 for direct host access.\n");
+#else
+	fprintf(stderr,
+		"Notice: this is not an x86_64 build; direct x86-owned output was not "
+		"selected.\n");
+#endif
 
 	status = doca_log_backend_create_with_file_sdk(stderr, &sdk_log);
 	if (status != DOCA_SUCCESS) {
@@ -704,7 +765,12 @@ int main(int argc, char **argv)
 		goto cleanup;
 	}
 
-	print_output(&resources.host_memory->output);
+	if (snapshot_output(&resources.host_memory->output,
+			    packet_count,
+			    &output_snapshot) != 0)
+		goto cleanup;
+
+	print_output(&output_snapshot);
 	exit_status = EXIT_SUCCESS;
 
 cleanup:
