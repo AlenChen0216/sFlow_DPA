@@ -1,0 +1,34 @@
+# Application TODOs
+
+The receive queues, memory registration, DPA application loading, UDP/8888
+steering, completion processing, and host visibility path are already wired.
+Your application-specific work is intentionally limited to these two functions
+in `dev/kernel.c`:
+
+1. `modify_packet()`
+
+   - Parse the Ethernet/IP/UDP headers safely.
+   - Validate every offset against `packet_length`.
+   - Modify the required header or payload bytes.
+   - If you change IP/UDP contents, update lengths and checksums.
+   - This starter is receive-only. Add a DPA Ethernet send queue if the changed
+     packet must go back onto the wire.
+
+2. `store_dedicated_data()`
+
+   - Extract the bytes or fields needed by the host.
+   - Write no more than `SFLOW_DEDICATED_DATA_CAPACITY` bytes.
+   - Set `output->dedicated_data_length` to the exact valid byte count.
+   - Keep multibyte field byte order documented in
+     `common/sflow_dpa_common.h`.
+
+Before production use:
+
+- Replace the finite RPC batch with a DPA thread/event-driven loop if the
+  receiver must run indefinitely.
+- Decide whether one latest-value record is sufficient. For multiple records,
+  define a ring with producer/consumer indices and explicit overrun behavior.
+- Add malformed/truncated/VLAN/IPv6 packet tests for the parser you implement.
+- Add a transmit queue only if packets must be forwarded or reflected.
+- Measure host-memory access cost. For a hot path, stage work in DPA memory and
+  publish compact records to host memory in batches.
