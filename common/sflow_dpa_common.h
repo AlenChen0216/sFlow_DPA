@@ -45,7 +45,7 @@ struct sflow_dedicated_output {
 } __attribute__((aligned(64)));
 
 /*
- * One host allocation is registered twice:
+ * One control-process allocation is registered twice:
  *
  *  - as an ibverbs MR, so the NIC receive queue can DMA packets into it;
  *  - as a DOCA mmap, so DPA code can obtain an external-memory pointer.

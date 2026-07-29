@@ -2,7 +2,8 @@
  * SPDX-License-Identifier: BSD-3-Clause
  *
  * DPA receive path for IPv4/UDP destination port 8888. Hardware steering is
- * installed by host/sflow_dpa_host.c; this file only sees matching packets.
+ * installed by dpu/sflow_dpa_comch_server.c; this file only sees matching
+ * packets.
  */
 
 #include <doca_dpa_dev.h>
