@@ -483,6 +483,8 @@ int main(int argc, char **argv)
 	struct doca_log_backend *sdk_log = NULL;
 	doca_error_t status;
 	int exit_status = EXIT_FAILURE;
+	struct timespec start_time;
+	struct timespec end_time;
 
 	if (argc != 2) {
 		fprintf(stderr, "Usage: %s <BlueField-PF-pci-address>\n", argv[0]);
@@ -519,6 +521,7 @@ int main(int argc, char **argv)
 	status = create_comch_client(argv[1], &state);
 	if (status != DOCA_SUCCESS)
 		goto cleanup;
+	clock_gettime(CLOCK_MONOTONIC, &start_time);
 	status = run_comch_client(&state);
 	if (status != DOCA_SUCCESS) {
 		log_doca_error("Comch request failed", status);
@@ -527,6 +530,10 @@ int main(int argc, char **argv)
 	if (validate_output(&state.output) != 0)
 		goto cleanup;
 
+	clock_gettime(CLOCK_MONOTONIC, &end_time);
+	uint64_t elapsed_ns = (end_time.tv_sec - start_time.tv_sec) * 1000000000LL +
+			     (end_time.tv_nsec - start_time.tv_nsec);
+	printf("Comch request completed successfully in %" PRIu64 " ns\n", elapsed_ns);
 	print_output(&state.output);
 	exit_status = EXIT_SUCCESS;
 
