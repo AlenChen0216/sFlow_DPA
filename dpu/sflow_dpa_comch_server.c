@@ -1154,7 +1154,7 @@ int main(int argc, char **argv)
 {
 	struct app_resources resources = {0};
 	struct comch_server_state comch_state = {0};
-	struct sflow_dedicated_output output_snapshot;
+	struct sflow_dedicated_output *output_snapshot = NULL;
 	struct doca_log_backend *sdk_log = NULL;
 	uint32_t packet_count = 1;
 	uint64_t rpc_return_value = UINT64_MAX;
@@ -1197,6 +1197,14 @@ int main(int argc, char **argv)
 		return EXIT_FAILURE;
 	}
 
+	output_snapshot = malloc(sizeof(*output_snapshot));
+	if (output_snapshot == NULL) {
+		fprintf(stderr,
+			"Failed to allocate %zu-byte DPA output snapshot\n",
+			sizeof(*output_snapshot));
+		return EXIT_FAILURE;
+	}
+
 	status = create_resources(argv[1], &resources);
 	if (status != DOCA_SUCCESS)
 		goto cleanup;
@@ -1230,13 +1238,13 @@ int main(int argc, char **argv)
 
 	if (snapshot_output(&resources.host_memory->output,
 			    packet_count,
-			    &output_snapshot) != 0)
+			    output_snapshot) != 0)
 		goto cleanup;
 
 	printf("Captured sflow_dedicated_output: %" PRIu64
 	       " packet(s), %zu bytes\n",
-	       output_snapshot.packets_received,
-	       sizeof(output_snapshot));
+	       output_snapshot->packets_received,
+	       sizeof(*output_snapshot));
 
 	if (signal(SIGINT, handle_stop_signal) == SIG_ERR ||
 	    signal(SIGTERM, handle_stop_signal) == SIG_ERR) {
@@ -1246,7 +1254,7 @@ int main(int argc, char **argv)
 	}
 	status = create_comch_server(resources.dev,
 				     argv[2],
-				     &output_snapshot,
+				     output_snapshot,
 				     &comch_state);
 	if (status != DOCA_SUCCESS)
 		goto cleanup;
@@ -1259,5 +1267,6 @@ int main(int argc, char **argv)
 cleanup:
 	stop_and_destroy_comch_server(&comch_state);
 	destroy_resources(&resources);
+	free(output_snapshot);
 	return exit_status;
 }

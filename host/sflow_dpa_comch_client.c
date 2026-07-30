@@ -442,16 +442,19 @@ static int validate_output(const struct sflow_dedicated_output *output)
 			output->last_packet_length);
 		return -1;
 	}
+	if (output->dedicated_data_count > SFLOW_DEDICATED_DATA_CAPACITY) {
+		fprintf(stderr,
+			"Invalid dedicated data count: %" PRIu32 "\n",
+			output->dedicated_data_count);
+		return -1;
+	}
 	return 0;
 }
 
 static void print_output(const struct sflow_dedicated_output *output)
 {
-	uint32_t reported_length = output->dedicated_data_length;
+	uint32_t entries_printed = 0;
 	uint32_t i;
-
-	if (reported_length > SFLOW_DEDICATED_DATA_CAPACITY)
-		reported_length = SFLOW_DEDICATED_DATA_CAPACITY;
 
 	printf("DPA output:\n");
 	printf("  ABI version:           %" PRIu32 "\n", output->abi_version);
@@ -460,14 +463,19 @@ static void print_output(const struct sflow_dedicated_output *output)
 	       output->last_packet_length);
 	printf("  last packet timestamp: %" PRIu64 "\n",
 	       output->last_packet_timestamp);
-	printf("  dedicated data length: %" PRIu32 "\n", reported_length);
+	printf("  dedicated data count:  %" PRIu32 "\n",
+	       output->dedicated_data_count);
 	printf("  dedicated data:");
-	for (i = 0; i < SFLOW_DEDICATED_DATA_CAPACITY; ++i) {
+	for (i = 0;
+	     i < SFLOW_DEDICATED_DATA_CAPACITY &&
+	     entries_printed < output->dedicated_data_count;
+	     ++i) {
 		const struct hash_entry *entry = &output->dedicated_data[i];
 		size_t key_length;
 
 		if (entry->data.cnt == 0)
 			continue;
+		entries_printed++;
 		key_length = strnlen(entry->key, sizeof(entry->key));
 		printf("\n    key: %.*s, count: %" PRIu32,
 		       (int)key_length,
@@ -479,7 +487,7 @@ static void print_output(const struct sflow_dedicated_output *output)
 
 int main(int argc, char **argv)
 {
-	struct comch_client_state state = {0};
+	struct comch_client_state *state = NULL;
 	struct doca_log_backend *sdk_log = NULL;
 	doca_error_t status;
 	int exit_status = EXIT_FAILURE;
@@ -516,28 +524,37 @@ int main(int argc, char **argv)
 		return EXIT_FAILURE;
 	}
 
+	state = calloc(1, sizeof(*state));
+	if (state == NULL) {
+		fprintf(stderr,
+			"Failed to allocate %zu-byte Comch client state\n",
+			sizeof(*state));
+		return EXIT_FAILURE;
+	}
+
 	printf("Requesting sflow_dedicated_output from Comch server '%s'...\n",
 	       SFLOW_COMCH_SERVER_NAME);
-	status = create_comch_client(argv[1], &state);
+	status = create_comch_client(argv[1], state);
 	if (status != DOCA_SUCCESS)
 		goto cleanup;
 	clock_gettime(CLOCK_MONOTONIC, &start_time);
-	status = run_comch_client(&state);
+	status = run_comch_client(state);
 	if (status != DOCA_SUCCESS) {
 		log_doca_error("Comch request failed", status);
 		goto cleanup;
 	}
-	if (validate_output(&state.output) != 0)
+	if (validate_output(&state->output) != 0)
 		goto cleanup;
 
 	clock_gettime(CLOCK_MONOTONIC, &end_time);
 	uint64_t elapsed_ns = (end_time.tv_sec - start_time.tv_sec) * 1000000000LL +
 			     (end_time.tv_nsec - start_time.tv_nsec);
 	printf("Comch request completed successfully in %" PRIu64 " ns\n", elapsed_ns);
-	print_output(&state.output);
+	print_output(&state->output);
 	exit_status = EXIT_SUCCESS;
 
 cleanup:
-	stop_and_destroy_client(&state);
+	stop_and_destroy_client(state);
+	free(state);
 	return exit_status;
 }

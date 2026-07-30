@@ -17,9 +17,9 @@ application-specific work is intentionally limited to these two functions in
 
 2. `store_dedicated_data()`
 
-   - Extract the bytes or fields needed by the host.
-   - Write no more than `SFLOW_DEDICATED_DATA_CAPACITY` bytes.
-   - Set `output->dedicated_data_length` to the exact valid byte count.
+   - Extract the keys or fields needed by the host.
+   - Store no more than `SFLOW_DEDICATED_DATA_CAPACITY` entries.
+   - Keep `output->dedicated_data_count` equal to the number of occupied entries.
    - Keep multibyte field byte order documented in
      `common/sflow_dpa_common.h`.
 

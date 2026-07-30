@@ -61,45 +61,70 @@ static inline void modify_packet(uint8_t *packet, uint32_t packet_length)
 
 static inline uint32_t hash_key(const char *key, size_t key_length)
 {
-	uint32_t hash = 0;
-	for(size_t i = 0 ; i < key_length; i++){
-		hash += key[i];
+	uint32_t hash = 2166136261U;
+	size_t i;
+
+	for (i = 0; i < key_length; ++i) {
+		hash ^= (uint8_t)key[i];
+		hash *= 16777619U;
 	}
 	return hash;
+}
+
+static inline int keys_equal(const char *left, const char *right, size_t length)
+{
+	size_t i;
+
+	for (i = 0; i < length; ++i) {
+		if (left[i] != right[i])
+			return 0;
+	}
+	return 1;
 }
 
 /*
  * TODO(data-storage): Extract and store your dedicated data here.
  *
- * Write at most SFLOW_DEDICATED_DATA_CAPACITY bytes to
- * output->dedicated_data and set output->dedicated_data_length to the number
- * of valid bytes. The host prints exactly that range after the receive batch.
+ * Store at most SFLOW_DEDICATED_DATA_CAPACITY entries in
+ * output->dedicated_data. dedicated_data_count tracks occupied entries.
  *
- * The skeleton deliberately stores no packet bytes. It only publishes the
- * packet count, length, and timestamp, proving that the registration and
- * DPA-to-host visibility path works before application-specific logic exists.
+ * FNV-1a selects the initial bucket. Linear probing keeps distinct keys that
+ * collide instead of overwriting an existing entry.
  */
 static inline void store_dedicated_data(const uint8_t *packet,
 					uint32_t packet_length,
 					struct sflow_dedicated_output *output)
 {
-	output->dedicated_data_length = packet_length;
 	uint8_t seg_cnt = 0;
 	while (packet_length >= UDP_OFFSET + SEG_OFFSET * (seg_cnt + 1)){
 		uint32_t hash;
+		uint32_t probe;
 		char key[128];
+
 		copy_bytes((uint8_t *)key,
 			   packet + UDP_OFFSET + SEG_OFFSET * seg_cnt,
 			   SEG_OFFSET);
 		key[SEG_OFFSET] = '\0';
-		hash = hash_key(key, 8);
-		copy_bytes(
-			(uint8_t *)output
-				->dedicated_data[hash % SFLOW_DEDICATED_DATA_CAPACITY]
-				.key,
-			(const uint8_t *)key,
-			SEG_OFFSET + 1);
-		output->dedicated_data[hash % SFLOW_DEDICATED_DATA_CAPACITY].data.cnt++;
+		hash = hash_key(key, SEG_OFFSET);
+
+		for (probe = 0; probe < SFLOW_DEDICATED_DATA_CAPACITY; ++probe) {
+			uint32_t index =
+				(hash + probe) & (SFLOW_DEDICATED_DATA_CAPACITY - 1U);
+			struct hash_entry *entry = &output->dedicated_data[index];
+
+			if (entry->data.cnt == 0) {
+				copy_bytes((uint8_t *)entry->key,
+					   (const uint8_t *)key,
+					   SEG_OFFSET + 1);
+				entry->data.cnt = 1;
+				output->dedicated_data_count++;
+				break;
+			}
+			if (keys_equal(entry->key, key, SEG_OFFSET + 1)) {
+				entry->data.cnt++;
+				break;
+			}
+		}
 		seg_cnt++;
 	}
 }

@@ -31,13 +31,13 @@ x86 GET_OUTPUT ---- DOCA Comch ------>|
 x86 output       <--- framed chunks --+
 ```
 
-`sflow_dedicated_output` is currently 135,232 bytes, which is larger than one
-Comch control message. The shared protocol in
-`common/sflow_comch_protocol.h` therefore frames the snapshot into sequential
-chunks. The server queries the device's maximum Comch message size instead of
-assuming a fixed limit. Each frame contains the request ID, output ABI version,
-total length, byte offset, and payload length. The client rejects missing,
-incompatible, or out-of-order frames.
+`sflow_dedicated_output` contains 1,048,576 hash-table entries and is currently
+138,412,096 bytes, which is larger than one Comch control message. The shared
+protocol in `common/sflow_comch_protocol.h` therefore frames the snapshot into
+sequential chunks. The server queries the device's maximum Comch message size
+instead of assuming a fixed limit. Each frame contains the request ID, output
+ABI version, total length, byte offset, and payload length. The client rejects
+missing, incompatible, or out-of-order frames.
 
 ## Requirements
 
