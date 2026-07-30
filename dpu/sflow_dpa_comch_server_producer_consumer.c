@@ -121,6 +121,58 @@ static void handle_stop_signal(int signal_number)
 }
 
 /*
+ * Comch fast-path mmap import cannot use the doca_dev returned by
+ * doca_verbs_pd_as_doca_dev(), because that device is backed by an external
+ * protection domain. Open a separate, ordinary device handle for the Comch
+ * server, producer, representor, and producer mmap.
+ */
+static doca_error_t open_comch_device(const char *device_name,
+				      struct doca_dev **dev)
+{
+	struct doca_devinfo **devinfo_list = NULL;
+	uint32_t device_count = 0;
+	doca_error_t status;
+	uint32_t i;
+
+	*dev = NULL;
+	status = doca_devinfo_create_list(&devinfo_list, &device_count);
+	if (status != DOCA_SUCCESS) {
+		log_doca_error("doca_devinfo_create_list failed", status);
+		return status;
+	}
+
+	status = DOCA_ERROR_NOT_FOUND;
+	for (i = 0; i < device_count; ++i) {
+		char found_name[DOCA_DEVINFO_IBDEV_NAME_SIZE + 1] = {0};
+
+		if (doca_devinfo_get_ibdev_name(devinfo_list[i],
+						found_name,
+						DOCA_DEVINFO_IBDEV_NAME_SIZE) !=
+		    DOCA_SUCCESS ||
+		    strcmp(found_name, device_name) != 0)
+			continue;
+
+		status = doca_comch_cap_server_is_supported(devinfo_list[i]);
+		if (status != DOCA_SUCCESS)
+			break;
+		status = doca_comch_producer_cap_is_supported(devinfo_list[i]);
+		if (status != DOCA_SUCCESS)
+			break;
+		status = doca_dev_open(devinfo_list[i], dev);
+		break;
+	}
+
+	(void)doca_devinfo_destroy_list(devinfo_list);
+	if (status != DOCA_SUCCESS) {
+		fprintf(stderr,
+			"Unable to open standard Comch device '%s': %s\n",
+			device_name,
+			doca_error_get_descr(status));
+	}
+	return status;
+}
+
+/*
  * Find the requested PF and create a DOCA Verbs context for it.
  */
 static doca_error_t create_verbs_context(const char *device_name,
@@ -1334,7 +1386,7 @@ static void control_context_state_changed_callback(
 }
 
 static doca_error_t create_comch_producer_server(
-	struct doca_dev *dev,
+	const char *device_name,
 	const char *representor_pci_address,
 	const struct sflow_dedicated_output *output,
 	struct comch_producer_server_state *state)
@@ -1343,23 +1395,15 @@ static doca_error_t create_comch_producer_server(
 	union doca_data context_data = {0};
 	uint32_t max_producer_tasks;
 	doca_error_t status;
+	struct doca_dev *dev;
 
-	state->dev = dev;
 	state->output = output;
 
-	status = doca_comch_cap_server_is_supported(doca_dev_as_devinfo(dev));
-	if (status != DOCA_SUCCESS) {
-		log_doca_error("DOCA device does not support a Comch server",
-			       status);
+	status = open_comch_device(device_name, &state->dev);
+	if (status != DOCA_SUCCESS)
 		return status;
-	}
-	status = doca_comch_producer_cap_is_supported(
-		doca_dev_as_devinfo(dev));
-	if (status != DOCA_SUCCESS) {
-		log_doca_error("DOCA device does not support a Comch producer",
-			       status);
-		return status;
-	}
+	dev = state->dev;
+
 	status = doca_comch_cap_get_max_msg_size(
 		doca_dev_as_devinfo(dev),
 		&state->max_control_message_size);
@@ -1546,6 +1590,11 @@ static void stop_and_destroy_comch_producer_server(
 		status = doca_dev_rep_close(state->representor);
 		if (status != DOCA_SUCCESS)
 			log_doca_error("doca_dev_rep_close failed", status);
+	}
+	if (state->dev != NULL) {
+		status = doca_dev_close(state->dev);
+		if (status != DOCA_SUCCESS)
+			log_doca_error("doca_dev_close(Comch) failed", status);
 	}
 	free(state->control_frame);
 }
@@ -1736,7 +1785,7 @@ int main(int argc, char **argv)
 			strerror(errno));
 		goto cleanup;
 	}
-	status = create_comch_producer_server(resources.dev,
+	status = create_comch_producer_server(argv[1],
 					      argv[2],
 					      output_snapshot,
 					      &comch_state);
