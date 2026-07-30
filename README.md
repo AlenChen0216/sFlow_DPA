@@ -1,6 +1,7 @@
 # sFlow DPA receiver with a DOCA Comch output service
 
-This project has two user-space programs:
+This project has two communication variants, each with a DPU server and an x86
+client:
 
 - `sflow_dpa_comch_server` runs on the BlueField Arm cores. It loads the DPA
   program, steers IPv4/UDP destination port 8888 into a DPA receive queue,
@@ -9,6 +10,10 @@ This project has two user-space programs:
 - `sflow_dpa_comch_client` runs on the x86 host. It connects to the server,
   sends a `GET_OUTPUT` request, reassembles the response, validates it, and
   prints the result.
+- `sflow_dpa_comch_server_producer_consumer` and
+  `sflow_dpa_comch_client_producer_consumer` preserve the same capture and
+  request behavior but transfer the large snapshot through the high-speed
+  Comch producer/consumer data path.
 
 The server remains available after a response, so clients can request the
 captured snapshot sequentially. Press Ctrl-C on the DPU to stop it.
@@ -39,6 +44,29 @@ instead of assuming a fixed limit. Each frame contains the request ID, output
 ABI version, total length, byte offset, and payload length. The client rejects
 missing, incompatible, or out-of-order frames.
 
+### Producer/consumer fast path
+
+The copied producer/consumer pair uses the control channel only for the
+`GET_OUTPUT` request and error responses:
+
+```text
+x86 consumer: register output memory and post receive buffer
+        |
+        +---- GET_OUTPUT + consumer buffer limit ----> DPU control channel
+                                                       |
+DPU producer: map snapshot, send doca_buf chunks -------+
+        |
+        +---- DMA/PCIe fast path + immediate header ---> x86 output memory
+```
+
+The client advertises its maximum consumer buffer size in the request. The
+server chooses the smaller of that value and its producer capability for every
+chunk. Each producer task directly references the snapshot; the matching
+consumer task receives directly into the final output structure. The 32-byte
+header is immediate data, so payload bytes are not copied into control-channel
+frames. The separate protocol is defined in
+`common/sflow_comch_producer_consumer_protocol.h`.
+
 ## Requirements
 
 - BlueField-3 or a supported newer DPA device
@@ -47,8 +75,8 @@ missing, incompatible, or out-of-order frames.
 - root privileges
 - a PF Ethernet `mlx5` device
 
-The Meson build is architecture-aware: it builds only the server on
-`aarch64` and only the client on `x86_64`.
+The Meson build is architecture-aware: it builds only the server targets on
+`aarch64` and only the client targets on `x86_64`.
 
 ## Build the DPU server
 
@@ -65,6 +93,8 @@ file build-dpu/sflow_dpa_comch_server
 
 The final command must report an AArch64 executable. DPACC compiles
 `dev/kernel.c` and links the generated host archive into the server.
+The build also produces
+`build-dpu/sflow_dpa_comch_server_producer_consumer`.
 
 ## Build the x86 client
 
@@ -80,6 +110,8 @@ file build-x86/sflow_dpa_comch_client
 
 The final command must report an x86-64 executable. The x86 build needs
 `doca-common` and `doca-comch`; it does not compile the DPA device program.
+The build also produces
+`build-x86/sflow_dpa_comch_client_producer_consumer`.
 
 ## Run
 
@@ -124,6 +156,21 @@ sudo ./build-x86/sflow_dpa_comch_client 0000:03:00.0
 The client exits after receiving and printing the complete
 `sflow_dedicated_output`. If the server is not ready, the client waits for the
 named Comch service. Use Ctrl-C to cancel.
+
+To use the producer/consumer pair instead, run:
+
+```bash
+# BlueField Arm
+sudo ./build-dpu/sflow_dpa_comch_server_producer_consumer \
+  <dpu-mlx5-device> <host-PF-representor-pci> [packet-count]
+
+# x86 host, after the DPU prints that the producer server is ready
+sudo ./build-x86/sflow_dpa_comch_client_producer_consumer \
+  <BlueField-PF-pci-address>
+```
+
+The producer/consumer pair uses the service name `sflow-dpa-output-pc`, so it
+cannot accidentally connect to the legacy control-channel-only pair.
 
 Do not run another control program against the same receive PF at the same
 time. The server captures its finite DPA batch before entering the Comch

@@ -80,10 +80,37 @@ if host_machine.cpu_family() == 'aarch64'
 		build_rpath: extra_build_rpath,
 		install: false,
 	)
+	executable(
+		'sflow_dpa_comch_server_producer_consumer',
+		'dpu/sflow_dpa_comch_server_producer_consumer.c',
+		dependencies: [
+			doca_common_dep,
+			doca_comch_dep,
+			doca_dpa_dep,
+			doca_verbs_dep,
+			doca_flow_dep,
+			ibverbs_dep,
+			mlx5_dep,
+			flexio_dep,
+			dpa_program_dep,
+		],
+		include_directories: extra_include_dirs,
+		build_rpath: extra_build_rpath,
+		install: false,
+	)
 elif host_machine.cpu_family() == 'x86_64'
 	executable(
 		'sflow_dpa_comch_client',
 		'host/sflow_dpa_comch_client.c',
+		dependencies: [
+			doca_common_dep,
+			doca_comch_dep,
+		],
+		install: false,
+	)
+	executable(
+		'sflow_dpa_comch_client_producer_consumer',
+		'host/sflow_dpa_comch_client_producer_consumer.c',
 		dependencies: [
 			doca_common_dep,
 			doca_comch_dep,
