@@ -100,6 +100,7 @@ struct comch_producer_server_state {
 	bool consumer_available;
 	bool transfer_active;
 	bool transfer_pending;
+	bool producer_send_retry_pending;
 	bool control_send_active;
 	bool producer_started;
 	bool producer_idle;
@@ -982,6 +983,34 @@ static doca_error_t submit_next_producer_chunk(
 	return status;
 }
 
+static void handle_producer_submission_result(
+	struct comch_producer_server_state *state,
+	doca_error_t status,
+	const char *failure_operation)
+{
+	if (status == DOCA_SUCCESS) {
+		state->producer_send_retry_pending = false;
+		return;
+	}
+
+	/*
+	 * The consumer advertises one receive buffer at a time. After a chunk
+	 * completes, its next buffer may not have reached the DPU yet. AGAIN is
+	 * normal Comch backpressure: no task remains allocated, so retry the same
+	 * offset after progressing both control and producer PEs.
+	 */
+	if (status == DOCA_ERROR_AGAIN) {
+		state->producer_send_retry_pending = true;
+		return;
+	}
+
+	state->producer_send_retry_pending = false;
+	state->producer_result = status;
+	state->transfer_active = false;
+	log_doca_error(failure_operation, status);
+	stop_producer(state);
+}
+
 static void producer_send_completion_callback(
 	struct doca_comch_producer_task_send *send_task,
 	union doca_data task_user_data,
@@ -1005,18 +1034,16 @@ static void producer_send_completion_callback(
 		       state->transfer_length);
 		state->producer_result = DOCA_SUCCESS;
 		state->transfer_active = false;
+		state->producer_send_retry_pending = false;
 		stop_producer(state);
 		return;
 	}
 
 	status = submit_next_producer_chunk(state);
-	if (status != DOCA_SUCCESS) {
-		state->producer_result = status;
-		state->transfer_active = false;
-		log_doca_error("Failed to submit next Comch producer chunk",
-			       status);
-		stop_producer(state);
-	}
+	handle_producer_submission_result(
+		state,
+		status,
+		"Failed to submit next Comch producer chunk");
 }
 
 static void producer_send_error_callback(
@@ -1034,6 +1061,7 @@ static void producer_send_error_callback(
 	(void)doca_buf_dec_refcount((struct doca_buf *)buffer, NULL);
 	doca_task_free(doca_comch_producer_task_send_as_task(send_task));
 	state->last_chunk_length = 0;
+	state->producer_send_retry_pending = false;
 	state->producer_result = status;
 	state->transfer_active = false;
 	log_doca_error("Comch producer send failed", status);
@@ -1054,13 +1082,10 @@ static void producer_context_state_changed_callback(
 	switch (next_state) {
 	case DOCA_CTX_STATE_RUNNING:
 		status = submit_next_producer_chunk(state);
-		if (status != DOCA_SUCCESS) {
-			state->producer_result = status;
-			state->transfer_active = false;
-			log_doca_error("Failed to submit first Comch producer chunk",
-				       status);
-			stop_producer(state);
-		}
+		handle_producer_submission_result(
+			state,
+			status,
+			"Failed to submit first Comch producer chunk");
 		break;
 	case DOCA_CTX_STATE_IDLE:
 		if (state->transfer_active &&
@@ -1121,6 +1146,7 @@ static doca_error_t start_producer_transfer(
 
 	state->producer_started = true;
 	state->producer_idle = false;
+	state->producer_send_retry_pending = false;
 	state->transfer_pending = false;
 	return DOCA_SUCCESS;
 
@@ -1166,6 +1192,7 @@ static doca_error_t destroy_producer_data_path(
 	state->producer_idle = false;
 	state->transfer_active = false;
 	state->transfer_pending = false;
+	state->producer_send_retry_pending = false;
 	state->transfer_connection = NULL;
 	state->transfer_length = 0;
 	state->transfer_offset = 0;
@@ -1252,6 +1279,7 @@ static void control_message_receive_callback(
 		state->producer_result = DOCA_SUCCESS;
 		state->transfer_active = true;
 		state->transfer_pending = true;
+		state->producer_send_retry_pending = false;
 		return;
 	}
 
@@ -1326,6 +1354,7 @@ static void expired_consumer_callback(struct doca_comch_event_consumer *event,
 		state->producer_result = DOCA_ERROR_CONNECTION_ABORTED;
 		state->transfer_active = false;
 		state->transfer_pending = false;
+		state->producer_send_retry_pending = false;
 		stop_producer(state);
 	}
 }
@@ -1365,6 +1394,7 @@ static void disconnection_callback(
 		if (state->transfer_connection == connection) {
 			state->transfer_active = false;
 			state->transfer_pending = false;
+			state->producer_send_retry_pending = false;
 			stop_producer(state);
 		}
 	}
@@ -1628,11 +1658,24 @@ static doca_error_t run_comch_producer_server(
 				state->producer_result = status;
 				state->transfer_active = false;
 				state->transfer_pending = false;
+				state->producer_send_retry_pending = false;
 				state->transfer_connection = NULL;
 			}
 		}
 		if (state->producer_pe != NULL)
 			progress += doca_pe_progress(state->producer_pe);
+		if (state->producer_send_retry_pending &&
+		    state->transfer_active &&
+		    state->producer != NULL &&
+		    !state->producer_idle) {
+			status = submit_next_producer_chunk(state);
+			handle_producer_submission_result(
+				state,
+				status,
+				"Failed to retry Comch producer chunk");
+			if (status == DOCA_SUCCESS)
+				progress++;
+		}
 		if (state->producer != NULL && state->producer_idle) {
 			struct doca_comch_connection *connection =
 				state->transfer_connection;
@@ -1692,6 +1735,7 @@ int main(int argc, char **argv)
 	uint64_t rpc_return_value = UINT64_MAX;
 	doca_error_t status;
 	int exit_status = EXIT_FAILURE;
+	int allocation_status;
 
 	if (argc < 3 || argc > 4) {
 		fprintf(stderr,
@@ -1730,11 +1774,15 @@ int main(int argc, char **argv)
 		return EXIT_FAILURE;
 	}
 
-	output_snapshot = malloc(sizeof(*output_snapshot));
-	if (output_snapshot == NULL) {
+	allocation_status = posix_memalign((void **)&output_snapshot,
+					   64,
+					   sizeof(*output_snapshot));
+	if (allocation_status != 0) {
 		fprintf(stderr,
-			"Failed to allocate %zu-byte DPA output snapshot\n",
-			sizeof(*output_snapshot));
+			"Failed to allocate aligned %zu-byte DPA output "
+			"snapshot: %s\n",
+			sizeof(*output_snapshot),
+			strerror(allocation_status));
 		return EXIT_FAILURE;
 	}
 
@@ -1778,6 +1826,19 @@ int main(int argc, char **argv)
 	       " packet(s), %zu bytes\n",
 	       output_snapshot->packets_received,
 	       sizeof(*output_snapshot));
+
+	/*
+	 * Comch producer/consumer internally imports the x86 consumer mmap.
+	 * A device backed by the external Verbs PD cannot perform that import.
+	 * The DPA capture is complete and output_snapshot owns a stable copy, so
+	 * release every DPA/Verbs/Flow resource before opening the ordinary
+	 * Comch device. This also prevents DOCA from resolving the physical PF
+	 * through the external-PD device while setting up the fast path.
+	 */
+	destroy_resources(&resources);
+	resources = (struct app_resources){0};
+	printf("Released external-PD capture resources before Comch fast-path "
+	       "initialization\n");
 
 	if (signal(SIGINT, handle_stop_signal) == SIG_ERR ||
 	    signal(SIGTERM, handle_stop_signal) == SIG_ERR) {

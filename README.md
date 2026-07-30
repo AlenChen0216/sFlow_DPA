@@ -67,6 +67,16 @@ header is immediate data, so payload bytes are not copied into control-channel
 frames. The separate protocol is defined in
 `common/sflow_comch_producer_consumer_protocol.h`.
 
+The client posts one receive buffer at a time. If the producer reaches the next
+chunk before the replacement buffer is advertised, the server treats
+`DOCA_ERROR_AGAIN` as backpressure and retries that offset from its progress
+loop.
+
+After copying the finite DPA result into the output snapshot, the
+producer/consumer server releases its DPA, Verbs, Flow, and external-PD device
+resources before opening the standard Comch device. Comch fast-path consumer
+mmap import does not support a device backed by an external protection domain.
+
 ## Requirements
 
 - BlueField-3 or a supported newer DPA device

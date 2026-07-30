@@ -17,7 +17,7 @@
 #define SFLOW_RX_QUEUE_ID 0U
 #define SFLOW_RX_QUEUE_DEPTH 64U
 #define SFLOW_MAX_PACKET_SIZE 2048U
-#define SFLOW_DEDICATED_DATA_CAPACITY 131072U
+#define SFLOW_DEDICATED_DATA_CAPACITY 1048576U
 #define SFLOW_OUTPUT_ABI_VERSION 2U
 
 
@@ -60,8 +60,8 @@ struct sflow_host_memory {
 #define SFLOW_RX_SLOTS_OFFSET ((uint64_t)offsetof(struct sflow_host_memory, rx_slots))
 #define SFLOW_OUTPUT_OFFSET ((uint64_t)offsetof(struct sflow_host_memory, output))
 
-_Static_assert(SFLOW_DEDICATED_DATA_CAPACITY == 131072U,
-	       "The dedicated-data table must contain 131,072 elements");
+_Static_assert(SFLOW_DEDICATED_DATA_CAPACITY == 1048576U,
+	       "The dedicated-data table must contain 1,048,576 elements");
 _Static_assert((SFLOW_DEDICATED_DATA_CAPACITY &
 		(SFLOW_DEDICATED_DATA_CAPACITY - 1U)) == 0,
 	       "The dedicated-data table capacity must be a power of two");
