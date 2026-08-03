@@ -8,6 +8,7 @@
 
 #include <doca_dpa_dev.h>
 #include <doca_dpa_dev_buf.h>
+#include <doca_dpa_dev_sync_event.h>
 #include <doca_dpa_dev_verbs.h>
 #include <dpaintrin.h>
 
@@ -129,10 +130,126 @@ static inline void store_dedicated_data(const uint8_t *packet,
 	}
 }
 
+static inline void post_receive(doca_dpa_dev_verbs_eth_rq_t rq_handle,
+				uint64_t host_memory_address,
+				uint32_t receive_mkey,
+				uint32_t slot)
+{
+	struct doca_dpa_dev_verbs_recv_wr recv_wr;
+	struct doca_dpa_dev_verbs_sge sge;
+
+	sge.addr = host_memory_address + SFLOW_RX_SLOTS_OFFSET +
+		   ((uint64_t)slot * SFLOW_MAX_PACKET_SIZE);
+	sge.length = SFLOW_MAX_PACKET_SIZE;
+	sge.lkey = receive_mkey;
+
+	doca_dpa_dev_verbs_recv_wr_set_sg_list(&recv_wr, &sge);
+	doca_dpa_dev_verbs_recv_wr_set_sg_num_sge(&recv_wr, 1);
+	doca_dpa_dev_verbs_eth_rq_post_recv_wr(rq_handle, &recv_wr);
+}
+
+static inline void process_receive(
+	doca_dpa_dev_completion_element_t completion,
+	doca_dpa_dev_uintptr_t external_base,
+	uint32_t slot,
+	struct sflow_dedicated_output *output)
+{
+	uint32_t received_bytes =
+		doca_dpa_dev_completion_element_get_received_bytes(completion);
+	uint8_t *packet;
+
+	if (received_bytes > SFLOW_MAX_PACKET_SIZE)
+		received_bytes = SFLOW_MAX_PACKET_SIZE;
+
+	packet = (uint8_t *)(external_base + SFLOW_RX_SLOTS_OFFSET +
+			     ((uint64_t)slot * SFLOW_MAX_PACKET_SIZE));
+
+	/* The NIC produced packet bytes; invalidate window reads before DPA loads. */
+	__dpa_thread_window_read_inv();
+
+	modify_packet(packet, received_bytes);
+
+	output->abi_version = SFLOW_OUTPUT_ABI_VERSION;
+	output->packets_received++;
+	output->last_packet_length = received_bytes;
+	output->last_packet_timestamp =
+		doca_dpa_dev_completion_element_get_timestamp(completion);
+	store_dedicated_data(packet, received_bytes, output);
+
+	/* Make packet edits and the output record visible to the Arm CPU. */
+	__dpa_thread_window_writeback();
+}
+
 /*
- * Post a finite receive batch, process every completion, and publish results
- * into host memory. A finite RPC keeps the registration skeleton testable; a
- * production daemon can later move the same body to a DPA thread/event model.
+ * Keep the receive queue full and process packets until the Arm control plane
+ * updates stop_event. This is launched asynchronously so the Arm thread stays
+ * available to progress Comch and take periodic output snapshots.
+ */
+__dpa_global__ void sflow_receive_kernel(doca_dpa_dev_verbs_eth_rq_t rq_handle,
+				       doca_dpa_dev_completion_t completion_handle,
+				       doca_dpa_dev_mmap_t host_mmap_handle,
+				       uint64_t host_memory_address,
+				       uint32_t receive_mkey,
+				       doca_dpa_dev_sync_event_t stop_event)
+{
+	doca_dpa_dev_uintptr_t external_base;
+	struct sflow_dedicated_output *output;
+	doca_dpa_dev_completion_element_t completion;
+	uint32_t i;
+	uint64_t stop_value = 0;
+
+	external_base = doca_dpa_dev_mmap_get_external_ptr(host_mmap_handle,
+							   host_memory_address);
+	if (external_base == 0)
+		return;
+
+	output = (struct sflow_dedicated_output *)(external_base + SFLOW_OUTPUT_OFFSET);
+	output->abi_version = SFLOW_OUTPUT_ABI_VERSION;
+	output->kernel_status = SFLOW_KERNEL_STATUS_RUNNING;
+	__dpa_thread_window_writeback();
+
+	for (i = 0; i < SFLOW_RX_QUEUE_DEPTH; ++i)
+		post_receive(rq_handle, host_memory_address, receive_mkey, i);
+	doca_dpa_dev_verbs_eth_rq_commit_recv(rq_handle);
+
+	for (;;) {
+		uint32_t wqe_counter;
+		uint32_t slot;
+
+		doca_dpa_dev_sync_event_get(stop_event, &stop_value);
+		if (stop_value != 0)
+			break;
+
+		if (!doca_dpa_dev_get_completion(completion_handle, &completion)) {
+			doca_dpa_dev_yield();
+			continue;
+		}
+
+		if (doca_dpa_dev_get_completion_type(completion) ==
+		    DOCA_DPA_DEV_COMP_RECV_ERR) {
+			doca_dpa_dev_completion_ack(completion_handle, 1);
+			output->kernel_status = SFLOW_KERNEL_STATUS_RECEIVE_ERROR;
+			__dpa_thread_window_writeback();
+			return;
+		}
+
+		wqe_counter = doca_dpa_dev_completion_element_get_wqe_counter(completion);
+		slot = wqe_counter % SFLOW_RX_QUEUE_DEPTH;
+		process_receive(completion, external_base, slot, output);
+
+		doca_dpa_dev_completion_ack(completion_handle, 1);
+		post_receive(rq_handle, host_memory_address, receive_mkey, slot);
+		doca_dpa_dev_verbs_eth_rq_commit_recv(rq_handle);
+	}
+
+	output->kernel_status = SFLOW_KERNEL_STATUS_STOPPED;
+	__dpa_thread_window_writeback();
+	return;
+}
+
+/*
+ * Preserve the finite RPC used by the producer/consumer compatibility pair.
+ * The regular Comch server above uses sflow_receive_kernel instead.
  */
 __dpa_rpc__ uint64_t sflow_receive_rpc(doca_dpa_dev_verbs_eth_rq_t rq_handle,
 				       doca_dpa_dev_completion_t completion_handle,
@@ -143,8 +260,6 @@ __dpa_rpc__ uint64_t sflow_receive_rpc(doca_dpa_dev_verbs_eth_rq_t rq_handle,
 {
 	doca_dpa_dev_uintptr_t external_base;
 	struct sflow_dedicated_output *output;
-	struct doca_dpa_dev_verbs_recv_wr recv_wr;
-	struct doca_dpa_dev_verbs_sge sge;
 	doca_dpa_dev_completion_element_t completion;
 	uint32_t i;
 
@@ -154,63 +269,36 @@ __dpa_rpc__ uint64_t sflow_receive_rpc(doca_dpa_dev_verbs_eth_rq_t rq_handle,
 	external_base = doca_dpa_dev_mmap_get_external_ptr(host_mmap_handle,
 							   host_memory_address);
 	if (external_base == 0)
-		return 2;
+		return SFLOW_KERNEL_STATUS_INVALID_MEMORY;
 
 	output = (struct sflow_dedicated_output *)(external_base + SFLOW_OUTPUT_OFFSET);
+	output->abi_version = SFLOW_OUTPUT_ABI_VERSION;
+	output->kernel_status = SFLOW_KERNEL_STATUS_RUNNING;
 
-	for (i = 0; i < packet_count; ++i) {
-		sge.addr = host_memory_address + SFLOW_RX_SLOTS_OFFSET +
-			   ((uint64_t)i * SFLOW_MAX_PACKET_SIZE);
-		sge.length = SFLOW_MAX_PACKET_SIZE;
-		sge.lkey = receive_mkey;
-
-		doca_dpa_dev_verbs_recv_wr_set_sg_list(&recv_wr, &sge);
-		doca_dpa_dev_verbs_recv_wr_set_sg_num_sge(&recv_wr, 1);
-		doca_dpa_dev_verbs_eth_rq_post_recv_wr(rq_handle, &recv_wr);
-	}
+	for (i = 0; i < packet_count; ++i)
+		post_receive(rq_handle, host_memory_address, receive_mkey, i);
 	doca_dpa_dev_verbs_eth_rq_commit_recv(rq_handle);
 
 	for (i = 0; i < packet_count; ++i) {
-		uint32_t wqe_counter;
 		uint32_t slot;
-		uint32_t received_bytes;
-		uint8_t *packet;
 
 		while (!doca_dpa_dev_get_completion(completion_handle, &completion))
 			;
-
 		if (doca_dpa_dev_get_completion_type(completion) ==
 		    DOCA_DPA_DEV_COMP_RECV_ERR) {
 			doca_dpa_dev_completion_ack(completion_handle, i + 1);
-			return 3;
+			output->kernel_status = SFLOW_KERNEL_STATUS_RECEIVE_ERROR;
+			__dpa_thread_window_writeback();
+			return SFLOW_KERNEL_STATUS_RECEIVE_ERROR;
 		}
 
-		wqe_counter = doca_dpa_dev_completion_element_get_wqe_counter(completion);
-		slot = wqe_counter % packet_count;
-		received_bytes =
-			doca_dpa_dev_completion_element_get_received_bytes(completion);
-		if (received_bytes > SFLOW_MAX_PACKET_SIZE)
-			received_bytes = SFLOW_MAX_PACKET_SIZE;
-
-		packet = (uint8_t *)(external_base + SFLOW_RX_SLOTS_OFFSET +
-				     ((uint64_t)slot * SFLOW_MAX_PACKET_SIZE));
-
-		/* The NIC produced packet bytes; invalidate window reads before DPA loads. */
-		__dpa_thread_window_read_inv();
-
-		modify_packet(packet, received_bytes);
-
-		output->abi_version = SFLOW_OUTPUT_ABI_VERSION;
-		output->packets_received = i + 1;
-		output->last_packet_length = received_bytes;
-		output->last_packet_timestamp =
-			doca_dpa_dev_completion_element_get_timestamp(completion);
-		store_dedicated_data(packet, received_bytes, output);
-
-		/* Make packet edits and the output record visible to the host CPU. */
-		__dpa_thread_window_writeback();
+		slot = doca_dpa_dev_completion_element_get_wqe_counter(completion) %
+		       packet_count;
+		process_receive(completion, external_base, slot, output);
 	}
 
 	doca_dpa_dev_completion_ack(completion_handle, packet_count);
+	output->kernel_status = SFLOW_KERNEL_STATUS_STOPPED;
+	__dpa_thread_window_writeback();
 	return 0;
 }

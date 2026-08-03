@@ -18,7 +18,12 @@
 #define SFLOW_RX_QUEUE_DEPTH 64U
 #define SFLOW_MAX_PACKET_SIZE 2048U
 #define SFLOW_DEDICATED_DATA_CAPACITY 1048576U
-#define SFLOW_OUTPUT_ABI_VERSION 2U
+#define SFLOW_OUTPUT_ABI_VERSION 3U
+
+#define SFLOW_KERNEL_STATUS_RUNNING UINT64_C(0)
+#define SFLOW_KERNEL_STATUS_STOPPED UINT64_C(1)
+#define SFLOW_KERNEL_STATUS_INVALID_MEMORY UINT64_C(2)
+#define SFLOW_KERNEL_STATUS_RECEIVE_ERROR UINT64_C(3)
 
 
 struct stored_data{
@@ -32,9 +37,10 @@ struct hash_entry{
 
 /*
  * The host owns this output object. The DPA updates it after processing each
- * packet and flushes its external-memory window before returning from the RPC.
+ * packet and flushes its external-memory window while the receive kernel runs.
  */
 struct sflow_dedicated_output {
+	uint64_t kernel_status;
 	uint64_t packets_received;
 	uint64_t last_packet_timestamp;
 	uint32_t abi_version;

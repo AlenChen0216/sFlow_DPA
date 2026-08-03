@@ -25,9 +25,8 @@ application-specific work is intentionally limited to these two functions in
 
 Before production use:
 
-- Replace the finite RPC batch with a DPA thread/event-driven loop if the
-  receiver must run indefinitely. In that design, progress Comch concurrently
-  and define when a requested snapshot becomes consistent.
+- Add synchronization (for example, a generation counter or double buffer) so
+  the once-per-second Comch snapshot cannot race with DPA output updates.
 - Decide whether one latest-value record is sufficient. For multiple records,
   define a ring with producer/consumer indices and explicit overrun behavior.
 - Add malformed/truncated/VLAN/IPv6 packet tests for the parser you implement.

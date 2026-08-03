@@ -5,18 +5,19 @@ client:
 
 - `sflow_dpa_comch_server` runs on the BlueField Arm cores. It loads the DPA
   program, steers IPv4/UDP destination port 8888 into a DPA receive queue,
-  captures a finite packet batch, and exposes the resulting
-  `struct sflow_dedicated_output` through a DOCA Comch server.
+  runs the DPA receive kernel until a termination signal, and exposes a
+  once-per-second snapshot of `struct sflow_dedicated_output` through a DOCA
+  Comch server.
 - `sflow_dpa_comch_client` runs on the x86 host. It connects to the server,
-  sends a `GET_OUTPUT` request, reassembles the response, validates it, and
-  prints the result.
+  sends a `GET_OUTPUT` request for the latest periodic snapshot, reassembles
+  the response, validates it, and prints the result.
 - `sflow_dpa_comch_server_producer_consumer` and
-  `sflow_dpa_comch_client_producer_consumer` preserve the same capture and
-  request behavior but transfer the large snapshot through the high-speed
-  Comch producer/consumer data path.
+  `sflow_dpa_comch_client_producer_consumer` retain the finite-batch capture
+  mode but transfer the large snapshot through the high-speed Comch
+  producer/consumer data path.
 
 The server remains available after a response, so clients can request the
-captured snapshot sequentially. Press Ctrl-C on the DPU to stop it.
+latest snapshot sequentially. Press Ctrl-C on the DPU to stop it.
 
 ## Data and control paths
 
@@ -32,9 +33,22 @@ DPA Ethernet RQ -- DMA --> BlueField Arm registered packet slots
       v                              v
 DPA completion -> packet logic -> sflow_dedicated_output in Arm memory
                                       |
+Arm snapshot <------- every second ---+
+      |
 x86 GET_OUTPUT ---- DOCA Comch ------>|
 x86 output       <--- framed chunks --+
 ```
+
+The regular server launches `sflow_receive_kernel` asynchronously. A CPU-to-DPA
+sync event requests shutdown after `SIGINT`, `SIGTERM`, `SIGHUP`, or `SIGQUIT`,
+and a DPA-to-CPU sync event confirms that the kernel has returned before any
+receive resources are destroyed. The kernel keeps the receive queue full and
+reposts each completed slot.
+
+The BlueField Arm Comch loop copies the DPA-owned output record into its
+response snapshot once per second. This currently is an unsynchronized copy,
+so a snapshot can race with an update from `store_dedicated_data()` as allowed
+by the current prototype requirements.
 
 `sflow_dedicated_output` contains 1,048,576 hash-table entries and is currently
 138,412,096 bytes, which is larger than one Comch control message. The shared
@@ -88,6 +102,18 @@ mmap import does not support a device backed by an external protection domain.
 The Meson build is architecture-aware: it builds only the server targets on
 `aarch64` and only the client targets on `x86_64`.
 
+## VS Code IntelliSense
+
+The repository includes C/C++ extension configurations for both build hosts.
+On the BlueField, select `DPU (Arm + DPA device)` with **C/C++: Select
+IntelliSense Configuration**. On the x86 host, select `x86 host` instead.
+
+Run the matching `meson setup` command below at least once so the extension can
+read Meson's `compile_commands.json`. Files not emitted by the
+architecture-specific Meson build still use the fallback DOCA include paths;
+the DPA kernel uses DOCA's `dpa-clang` so its device keywords and intrinsics are
+recognized correctly.
+
 ## Build the DPU server
 
 Run on the BlueField Arm OS:
@@ -131,24 +157,24 @@ First identify:
 - on the DPU, the net representor PCI address corresponding to the host PF;
 - on x86, the BlueField PF PCI address used by the Comch client.
 
-Start the DPU server. The last argument is optional and defaults to one packet:
+Start the continuous DPU server:
 
 ```bash
 sudo ./build-dpu/sflow_dpa_comch_server \
-  <dpu-mlx5-device> <host-PF-representor-pci> [packet-count]
+  <dpu-mlx5-device> <host-PF-representor-pci>
 ```
 
-For example, to capture 16 packets:
+For example:
 
 ```bash
-sudo ./build-dpu/sflow_dpa_comch_server mlx5_0 0000:03:00.0 16
+sudo ./build-dpu/sflow_dpa_comch_server mlx5_0 0000:03:00.0
 ```
 
-Send the requested number of IPv4 UDP packets to destination port 8888. Once
-the DPA batch completes, the server prints:
+The DPA kernel immediately starts receiving IPv4 UDP packets sent to
+destination port 8888. The server prints:
 
 ```text
-Comch server 'sflow-dpa-output' is ready; press Ctrl-C to stop
+Comch server 'sflow-dpa-output' is ready and snapshots DPA output every second; press Ctrl-C to stop
 ```
 
 Then request the result from x86:
@@ -163,9 +189,10 @@ For example:
 sudo ./build-x86/sflow_dpa_comch_client 0000:03:00.0
 ```
 
-The client exits after receiving and printing the complete
-`sflow_dedicated_output`. If the server is not ready, the client waits for the
-named Comch service. Use Ctrl-C to cancel.
+The client exits after receiving and printing the latest complete
+`sflow_dedicated_output` snapshot. Run it again for a later snapshot. If the
+server is not ready, the client waits for the named Comch service. Use Ctrl-C
+to cancel.
 
 To use the producer/consumer pair instead, run:
 
@@ -179,12 +206,12 @@ sudo ./build-x86/sflow_dpa_comch_client_producer_consumer \
   <BlueField-PF-pci-address>
 ```
 
-The producer/consumer pair uses the service name `sflow-dpa-output-pc`, so it
-cannot accidentally connect to the legacy control-channel-only pair.
+The producer/consumer pair still waits for its finite packet batch before
+starting Comch. It uses the service name `sflow-dpa-output-pc`, so it cannot
+accidentally connect to the continuous control-channel-only pair.
 
 Do not run another control program against the same receive PF at the same
-time. The server captures its finite DPA batch before entering the Comch
-progress loop, so a client request should be made only after the ready message.
+time. Wait for the selected server's ready message before starting its client.
 
 ## Protocol compatibility
 
@@ -199,6 +226,9 @@ client checks:
 - exact structure length;
 - contiguous chunk offsets;
 - basic output field bounds.
+
+`kernel_status` reports whether the DPA receive kernel is running, stopped by
+the control plane, or exited after a receive error.
 
 Change `SFLOW_OUTPUT_ABI_VERSION` whenever the output structure layout or field
 meaning changes.

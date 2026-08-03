@@ -31,6 +31,7 @@
 #include <doca_types.h>
 #include <doca_verbs.h>
 #include <doca_verbs_bridge.h>
+#include <doca_sync_event.h>
 
 #include "../common/sflow_comch_protocol.h"
 #include "../common/sflow_dpa_common.h"
@@ -41,8 +42,8 @@
  */
 extern struct doca_dpa_app *sflow_dpa_app;
 
-/* DPACC also emits the host stub for the device RPC with this name. */
-doca_dpa_func_t sflow_receive_rpc;
+/* DPACC also emits the host stub for the device kernel with this name. */
+extern doca_dpa_func_t sflow_receive_kernel;
 
 struct app_resources {
 	struct doca_verbs_context *verbs_context;
@@ -65,7 +66,11 @@ struct app_resources {
 	struct ibv_mr *host_mr;
 	struct doca_mmap *host_mmap;
 	doca_dpa_dev_mmap_t host_mmap_handle;
+	struct doca_sync_event *kernel_stop_event;
+	doca_dpa_dev_sync_event_t kernel_stop_event_handle;
+	struct doca_sync_event *kernel_done_event;
 	uint32_t receive_mkey;
+	bool receive_kernel_launched;
 };
 
 struct comch_server_state {
@@ -74,7 +79,9 @@ struct comch_server_state {
 	struct doca_dev_rep *representor;
 	struct doca_comch_connection *active_connection;
 
-	const struct sflow_dedicated_output *output;
+	const struct sflow_dedicated_output *shared_output;
+	struct sflow_dedicated_output *output_snapshot;
+	struct doca_sync_event *kernel_done_event;
 	const uint8_t *transfer_data;
 	uint8_t *send_frame;
 	uint32_t max_message_size;
@@ -203,6 +210,60 @@ static doca_error_t create_dpa(struct app_resources *resources)
 	resources->dpa_started = true;
 
 	return DOCA_SUCCESS;
+}
+
+static doca_error_t create_kernel_sync_events(struct app_resources *resources)
+{
+	doca_error_t status;
+
+	status = doca_sync_event_create(&resources->kernel_stop_event);
+	if (status != DOCA_SUCCESS)
+		goto error;
+	status = doca_sync_event_add_publisher_location_cpu(
+		resources->kernel_stop_event,
+		resources->dev);
+	if (status != DOCA_SUCCESS)
+		goto error;
+	status = doca_sync_event_add_subscriber_location_dpa(
+		resources->kernel_stop_event,
+		resources->dpa);
+	if (status != DOCA_SUCCESS)
+		goto error;
+	status = doca_sync_event_start(resources->kernel_stop_event);
+	if (status != DOCA_SUCCESS)
+		goto error;
+	status = doca_sync_event_get_dpa_handle(
+		resources->kernel_stop_event,
+		resources->dpa,
+		&resources->kernel_stop_event_handle);
+	if (status != DOCA_SUCCESS)
+		goto error;
+	status = doca_sync_event_update_set(resources->kernel_stop_event, 0);
+	if (status != DOCA_SUCCESS)
+		goto error;
+
+	status = doca_sync_event_create(&resources->kernel_done_event);
+	if (status != DOCA_SUCCESS)
+		goto error;
+	status = doca_sync_event_add_publisher_location_dpa(
+		resources->kernel_done_event,
+		resources->dpa);
+	if (status != DOCA_SUCCESS)
+		goto error;
+	status = doca_sync_event_add_subscriber_location_cpu(
+		resources->kernel_done_event,
+		resources->dev);
+	if (status != DOCA_SUCCESS)
+		goto error;
+	status = doca_sync_event_start(resources->kernel_done_event);
+	if (status != DOCA_SUCCESS)
+		goto error;
+
+	return DOCA_SUCCESS;
+
+error:
+	log_doca_error("Failed to create DPA kernel sync events", status);
+	return status;
 }
 
 static doca_error_t create_completion(struct app_resources *resources)
@@ -562,6 +623,9 @@ static doca_error_t create_resources(const char *device_name,
 	status = create_dpa(resources);
 	if (status != DOCA_SUCCESS)
 		return status;
+	status = create_kernel_sync_events(resources);
+	if (status != DOCA_SUCCESS)
+		return status;
 	status = create_completion(resources);
 	if (status != DOCA_SUCCESS)
 		return status;
@@ -577,9 +641,73 @@ static doca_error_t create_resources(const char *device_name,
 	return register_host_memory(resources);
 }
 
+static doca_error_t launch_receive_kernel(struct app_resources *resources)
+{
+	doca_error_t status;
+
+	resources->host_memory->output.abi_version = SFLOW_OUTPUT_ABI_VERSION;
+	resources->host_memory->output.kernel_status =
+		SFLOW_KERNEL_STATUS_RUNNING;
+
+	status = doca_dpa_kernel_launch_update_set(
+		resources->dpa,
+		NULL,
+		0,
+		resources->kernel_done_event,
+		1,
+		1,
+		&sflow_receive_kernel,
+		resources->eth_rq_handle,
+		resources->completion_handle,
+		resources->host_mmap_handle,
+		(uint64_t)(uintptr_t)resources->host_memory,
+		resources->receive_mkey,
+		resources->kernel_stop_event_handle);
+	if (status != DOCA_SUCCESS) {
+		log_doca_error("Failed to launch sflow_receive_kernel", status);
+		return status;
+	}
+	resources->receive_kernel_launched = true;
+	return DOCA_SUCCESS;
+}
+
+static doca_error_t stop_receive_kernel(struct app_resources *resources)
+{
+	doca_error_t status;
+
+	if (!resources->receive_kernel_launched)
+		return DOCA_SUCCESS;
+
+	status = doca_sync_event_update_set(resources->kernel_stop_event, 1);
+	if (status != DOCA_SUCCESS) {
+		log_doca_error("Failed to signal sflow_receive_kernel", status);
+		return status;
+	}
+	status = doca_sync_event_wait_gt(resources->kernel_done_event,
+					0,
+					UINT64_MAX);
+	if (status != DOCA_SUCCESS) {
+		log_doca_error("Failed to wait for sflow_receive_kernel", status);
+		return status;
+	}
+	resources->receive_kernel_launched = false;
+
+	if (resources->host_memory->output.kernel_status !=
+	    SFLOW_KERNEL_STATUS_STOPPED) {
+		fprintf(stderr,
+			"sflow_receive_kernel stopped with status %" PRIu64 "\n",
+			resources->host_memory->output.kernel_status);
+		return DOCA_ERROR_UNEXPECTED;
+	}
+	return DOCA_SUCCESS;
+}
+
 static void destroy_resources(struct app_resources *resources)
 {
 	doca_error_t status;
+
+	if (resources->receive_kernel_launched)
+		(void)stop_receive_kernel(resources);
 
 	if (resources->udp_pipe != NULL)
 		doca_flow_pipe_destroy(resources->udp_pipe);
@@ -606,6 +734,16 @@ static void destroy_resources(struct app_resources *resources)
 		status = doca_dpa_completion_destroy(resources->completion);
 		if (status != DOCA_SUCCESS)
 			log_doca_error("doca_dpa_completion_destroy failed", status);
+	}
+	if (resources->kernel_done_event != NULL) {
+		status = doca_sync_event_destroy(resources->kernel_done_event);
+		if (status != DOCA_SUCCESS)
+			log_doca_error("doca_sync_event_destroy(done) failed", status);
+	}
+	if (resources->kernel_stop_event != NULL) {
+		status = doca_sync_event_destroy(resources->kernel_stop_event);
+		if (status != DOCA_SUCCESS)
+			log_doca_error("doca_sync_event_destroy(stop) failed", status);
 	}
 	if (resources->dpa_started) {
 		status = doca_dpa_stop(resources->dpa);
@@ -636,28 +774,13 @@ static void destroy_resources(struct app_resources *resources)
 		doca_flow_destroy();
 }
 
-static int parse_packet_count(const char *value, uint32_t *packet_count)
-{
-	char *end = NULL;
-	unsigned long parsed;
-
-	errno = 0;
-	parsed = strtoul(value, &end, 10);
-	if (errno != 0 || end == value || *end != '\0' ||
-	    parsed == 0 || parsed > SFLOW_RX_QUEUE_DEPTH)
-		return -1;
-
-	*packet_count = (uint32_t)parsed;
-	return 0;
-}
-
 /*
- * doca_dpa_rpc() is blocking. The DPA kernel writes this Arm-process-owned
- * allocation, executes __dpa_thread_window_writeback(), and only then returns.
- * Copying the record gives Comch a stable snapshot for all client requests.
+ * The DPA kernel writes this Arm-process-owned allocation and flushes its
+ * external-memory window after every packet. The Comch loop calls this once
+ * per second. Per the current design, no synchronization is used around the
+ * concurrent copy.
  */
 static int snapshot_output(const struct sflow_dedicated_output *shared_output,
-			   uint32_t expected_packets,
 			   struct sflow_dedicated_output *snapshot)
 {
 	memcpy(snapshot, shared_output, sizeof(*snapshot));
@@ -669,18 +792,16 @@ static int snapshot_output(const struct sflow_dedicated_output *shared_output,
 			SFLOW_OUTPUT_ABI_VERSION);
 		return -1;
 	}
-	if (snapshot->packets_received != expected_packets) {
-		fprintf(stderr,
-			"Incomplete DPA output: got %" PRIu64
-			" packet(s), expected %" PRIu32 "\n",
-			snapshot->packets_received,
-			expected_packets);
-		return -1;
-	}
 	if (snapshot->last_packet_length > SFLOW_MAX_PACKET_SIZE) {
 		fprintf(stderr,
 			"Invalid last packet length in DPA output: %" PRIu32 "\n",
 			snapshot->last_packet_length);
+		return -1;
+	}
+	if (snapshot->dedicated_data_count > SFLOW_DEDICATED_DATA_CAPACITY) {
+		fprintf(stderr,
+			"Invalid dedicated data count in DPA output: %" PRIu32 "\n",
+			snapshot->dedicated_data_count);
 		return -1;
 	}
 
@@ -941,8 +1062,8 @@ static void message_receive_callback(struct doca_comch_event_msg_recv *event,
 					request_id,
 					SFLOW_COMCH_MSG_OUTPUT_CHUNK,
 					SFLOW_COMCH_STATUS_OK,
-					state->output,
-					sizeof(*state->output));
+					state->output_snapshot,
+					sizeof(*state->output_snapshot));
 	}
 	if (status != DOCA_SUCCESS) {
 		log_doca_error("Failed to submit Comch response", status);
@@ -989,14 +1110,18 @@ static void context_state_changed_callback(const union doca_data user_data,
 
 static doca_error_t create_comch_server(struct doca_dev *dev,
 					const char *representor_pci_address,
-					const struct sflow_dedicated_output *output,
+					const struct sflow_dedicated_output *shared_output,
+					struct sflow_dedicated_output *output_snapshot,
+					struct doca_sync_event *kernel_done_event,
 					struct comch_server_state *state)
 {
 	struct doca_ctx *context;
 	union doca_data context_data = {0};
 	doca_error_t status;
 
-	state->output = output;
+	state->shared_output = shared_output;
+	state->output_snapshot = output_snapshot;
+	state->kernel_done_event = kernel_done_event;
 
 	status = doca_comch_cap_server_is_supported(doca_dev_as_devinfo(dev));
 	if (status != DOCA_SUCCESS) {
@@ -1127,14 +1252,52 @@ static doca_error_t run_comch_server(struct comch_server_state *state)
 		.tv_sec = 0,
 		.tv_nsec = 10000,
 	};
+	struct timespec next_snapshot;
 	struct doca_ctx *context = doca_comch_server_as_ctx(state->server);
 	doca_error_t status;
 
-	printf("Comch server '%s' is ready; press Ctrl-C to stop\n",
+	if (clock_gettime(CLOCK_MONOTONIC, &next_snapshot) != 0) {
+		fprintf(stderr, "clock_gettime failed: %s\n", strerror(errno));
+		return DOCA_ERROR_OPERATING_SYSTEM;
+	}
+	next_snapshot.tv_sec++;
+
+	printf("Comch server '%s' is ready and snapshots DPA output every second; "
+	       "press Ctrl-C to stop\n",
 	       SFLOW_COMCH_SERVER_NAME);
 	while (!stop_requested && !state->context_idle) {
+		struct timespec now;
+
 		if (doca_pe_progress(state->pe) == 0)
 			(void)nanosleep(&idle_delay, NULL);
+		if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+			fprintf(stderr, "clock_gettime failed: %s\n", strerror(errno));
+			return DOCA_ERROR_OPERATING_SYSTEM;
+		}
+		if (now.tv_sec > next_snapshot.tv_sec ||
+		    (now.tv_sec == next_snapshot.tv_sec &&
+		     now.tv_nsec >= next_snapshot.tv_nsec)) {
+			uint64_t kernel_done = 0;
+
+			if (snapshot_output(state->shared_output,
+					    state->output_snapshot) != 0)
+				return DOCA_ERROR_INVALID_VALUE;
+			status = doca_sync_event_get(state->kernel_done_event,
+						     &kernel_done);
+			if (status != DOCA_SUCCESS) {
+				log_doca_error("Failed to query DPA kernel state", status);
+				return status;
+			}
+			if (kernel_done != 0) {
+				fprintf(stderr,
+					"sflow_receive_kernel exited before a stop signal "
+					"(status %" PRIu64 ")\n",
+					state->output_snapshot->kernel_status);
+				return DOCA_ERROR_UNEXPECTED;
+			}
+			next_snapshot = now;
+			next_snapshot.tv_sec++;
+		}
 	}
 
 	if (!state->context_idle) {
@@ -1156,27 +1319,26 @@ int main(int argc, char **argv)
 	struct comch_server_state comch_state = {0};
 	struct sflow_dedicated_output *output_snapshot = NULL;
 	struct doca_log_backend *sdk_log = NULL;
-	uint32_t packet_count = 1;
-	uint64_t rpc_return_value = UINT64_MAX;
 	doca_error_t status;
+	doca_error_t kernel_stop_status;
 	int exit_status = EXIT_FAILURE;
 
-	if (argc < 3 || argc > 4) {
+	if (argc != 3) {
 		fprintf(stderr,
-			"Usage: %s <mlx5-device> <host-PF-representor-pci> "
-			"[packet-count: 1-%u]\n",
-			argv[0],
-			SFLOW_RX_QUEUE_DEPTH);
-		return EXIT_FAILURE;
-	}
-	if (argc == 4 && parse_packet_count(argv[3], &packet_count) != 0) {
-		fprintf(stderr, "Invalid packet count '%s'; expected 1-%u\n",
-			argv[3],
-			SFLOW_RX_QUEUE_DEPTH);
+			"Usage: %s <mlx5-device> <host-PF-representor-pci>\n",
+			argv[0]);
 		return EXIT_FAILURE;
 	}
 	if (geteuid() != 0) {
 		fprintf(stderr, "This program must run with root privileges\n");
+		return EXIT_FAILURE;
+	}
+	if (signal(SIGINT, handle_stop_signal) == SIG_ERR ||
+	    signal(SIGTERM, handle_stop_signal) == SIG_ERR ||
+	    signal(SIGHUP, handle_stop_signal) == SIG_ERR ||
+	    signal(SIGQUIT, handle_stop_signal) == SIG_ERR) {
+		fprintf(stderr, "Failed to install signal handlers: %s\n",
+			strerror(errno));
 		return EXIT_FAILURE;
 	}
 
@@ -1212,49 +1374,20 @@ int main(int argc, char **argv)
 	printf("Registered %zu bytes of BlueField Arm memory at %p\n",
 	       sizeof(*resources.host_memory),
 	       (void *)resources.host_memory);
-	printf("Waiting for %" PRIu32 " IPv4/UDP packet(s) to destination port %u...\n",
-	       packet_count,
+	printf("Continuously receiving IPv4/UDP packets to destination port %u...\n",
 	       SFLOW_UDP_DST_PORT);
 	fflush(stdout);
 
-	status = doca_dpa_rpc(resources.dpa,
-			      &sflow_receive_rpc,
-			      &rpc_return_value,
-			      resources.eth_rq_handle,
-			      resources.completion_handle,
-			      resources.host_mmap_handle,
-			      (uint64_t)(uintptr_t)resources.host_memory,
-			      resources.receive_mkey,
-			      packet_count);
-	if (status != DOCA_SUCCESS) {
-		log_doca_error("doca_dpa_rpc failed", status);
+	status = launch_receive_kernel(&resources);
+	if (status != DOCA_SUCCESS)
 		goto cleanup;
-	}
-	if (rpc_return_value != 0) {
-		fprintf(stderr, "DPA receive RPC returned error code %" PRIu64 "\n",
-			rpc_return_value);
+	if (snapshot_output(&resources.host_memory->output, output_snapshot) != 0)
 		goto cleanup;
-	}
-
-	if (snapshot_output(&resources.host_memory->output,
-			    packet_count,
-			    output_snapshot) != 0)
-		goto cleanup;
-
-	printf("Captured sflow_dedicated_output: %" PRIu64
-	       " packet(s), %zu bytes\n",
-	       output_snapshot->packets_received,
-	       sizeof(*output_snapshot));
-
-	if (signal(SIGINT, handle_stop_signal) == SIG_ERR ||
-	    signal(SIGTERM, handle_stop_signal) == SIG_ERR) {
-		fprintf(stderr, "Failed to install signal handlers: %s\n",
-			strerror(errno));
-		goto cleanup;
-	}
 	status = create_comch_server(resources.dev,
 				     argv[2],
+				     &resources.host_memory->output,
 				     output_snapshot,
+				     resources.kernel_done_event,
 				     &comch_state);
 	if (status != DOCA_SUCCESS)
 		goto cleanup;
@@ -1266,6 +1399,9 @@ int main(int argc, char **argv)
 
 cleanup:
 	stop_and_destroy_comch_server(&comch_state);
+	kernel_stop_status = stop_receive_kernel(&resources);
+	if (kernel_stop_status != DOCA_SUCCESS)
+		exit_status = EXIT_FAILURE;
 	destroy_resources(&resources);
 	free(output_snapshot);
 	return exit_status;

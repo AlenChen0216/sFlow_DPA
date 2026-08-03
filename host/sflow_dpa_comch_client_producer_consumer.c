@@ -903,6 +903,7 @@ static void print_output(const struct sflow_dedicated_output *output)
 
 	printf("DPA output:\n");
 	printf("  ABI version:           %" PRIu32 "\n", output->abi_version);
+	printf("  kernel status:         %" PRIu64 "\n", output->kernel_status);
 	printf("  packets received:      %" PRIu64 "\n",
 	       output->packets_received);
 	printf("  last packet length:    %" PRIu32 "\n",
